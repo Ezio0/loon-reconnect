@@ -52,6 +52,12 @@ def main():
     elif command == "open":
         if args[-1] in state.get("fail_urls", []):
             result = 7
+    elif command == "osascript":
+        if state.get("fail_hide"):
+            print("Simulated hide failure", file=sys.stderr)
+            result = 7
+        else:
+            print("hidden loon:// handler")
     elif command != "sleep":
         raise AssertionError("Unexpected command: " + command)
     state_path.write_text(json.dumps(state))

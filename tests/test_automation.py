@@ -222,32 +222,90 @@ class AutomationTests(unittest.TestCase):
         self.control("install", success=False)
         self.assertTrue(self.app.is_symlink())
 
+    def run_runtime(self, failures=(), fail_hide=False):
+        self.write_state({"calls": [], "fail_urls": list(failures), "fail_hide": fail_hide})
+        source = RUNTIME.read_text()
+        # Fail before execution if the known command seams change.
+        self.assertEqual(source.count("/usr/bin/open"), 1)
+        self.assertEqual(source.count("/bin/sleep"), 3)
+        self.assertEqual(source.count("/usr/bin/osascript"), 1)
+        for command, original in (("open", "/usr/bin/open"), ("sleep", "/bin/sleep"),
+                                  ("osascript", "/usr/bin/osascript")):
+            wrapper = self.base / ("fake_" + command)
+            invocation = [sys.executable, str(FIXTURE), str(self.state_path), command]
+            wrapper.write_text("#!/bin/sh\nexec " + shlex.join(invocation) + ' "$@"\n')
+            wrapper.chmod(0o700)
+            source = source.replace(original, shlex.quote(str(wrapper)))
+        runtime = self.base / "reconnect-under-test.sh"
+        runtime.write_text(source)
+        return subprocess.run(["/bin/sh", str(runtime)], text=True, capture_output=True)
+
     def test_runtime_sequence_and_failures(self):
         expected = [
-            ["open", "-g", "loon://off"], ["sleep", "3"],
-            ["open", "-g", "loon://on"], ["sleep", "10"],
-            ["open", "-g", "loon://update?sub=all"],
+            ["open", "-g", "-j", "loon://off"], ["sleep", "3"],
+            ["open", "-g", "-j", "loon://on"], ["sleep", "10"],
+            ["open", "-g", "-j", "loon://update?sub=all"], ["sleep", "2"],
+            ["osascript", "-l", "JavaScript"],
         ]
         for failures in ([], ["loon://off"], ["loon://on"], ["loon://update?sub=all"]):
             with self.subTest(failures=failures):
-                self.write_state({"calls": [], "fail_urls": failures})
-                source = RUNTIME.read_text()
-                # Fail before execution if the known command seams change.
-                self.assertEqual(source.count("/usr/bin/open"), 1)
-                self.assertEqual(source.count("/bin/sleep"), 2)
-                for command, original in (("open", "/usr/bin/open"), ("sleep", "/bin/sleep")):
-                    wrapper = self.base / ("fake_" + command)
-                    invocation = [sys.executable, str(FIXTURE), str(self.state_path), command]
-                    wrapper.write_text("#!/bin/sh\nexec " + shlex.join(invocation) + ' "$@"\n')
-                    wrapper.chmod(0o700)
-                    source = source.replace(original, shlex.quote(str(wrapper)))
-                runtime = self.base / "reconnect-under-test.sh"
-                runtime.write_text(source)
-                result = subprocess.run(["/bin/sh", str(runtime)], text=True, capture_output=True)
+                result = self.run_runtime(failures)
                 self.assertEqual(result.returncode, int(bool(failures)))
                 self.assertEqual(self.read_state()["calls"], expected)
                 self.assertEqual(result.stdout.count(" sent "), 3 - len(failures))
                 self.assertEqual(result.stderr.count(" failed "), len(failures))
+                self.assertIn("hidden loon:// handler", result.stdout)
+
+    def test_hide_failure_is_reported_after_network_actions(self):
+        result = self.run_runtime(fail_hide=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout.count(" sent "), 3)
+        self.assertIn("failed to hide", result.stderr)
+        self.assertEqual(self.read_state()["calls"][-1], ["osascript", "-l", "JavaScript"])
+
+    def hide_logic(self, scenario):
+        source = RUNTIME.read_text()
+        marker = "<<'LOON_HIDE_JXA'\n"
+        self.assertIn(marker, source)
+        helper = source.split(marker, 1)[1].split("\nLOON_HIDE_JXA", 1)[0]
+        fixture = (ROOT / "tests/fixtures/hide-app.js").read_text()
+        script = self.base / "hide-with-fake-appkit.js"
+        script.write_text(fixture + "\nvar helperSource = " + json.dumps(helper) +
+                          ";\nvar testCase = " + json.dumps(scenario) + ";\n")
+        result = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", str(script)],
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return json.loads(result.stdout)
+
+    def test_hide_helper_targets_only_current_handler(self):
+        result = self.hide_logic({"bundleId": "org.example.CurrentLoon", "apps": [
+            {"pid": 1}, {"pid": 2, "hidden": True}, {"pid": 3},
+            {"pid": 4, "bundleId": "org.example.Other"}
+        ]})
+        self.assertNotIn("error", result)
+        self.assertEqual(result["requested"], [1, 3])
+        self.assertEqual([app["hidden"] for app in result["apps"]], [True, True, True, False])
+        self.assertGreater(result["clock"], 0)
+
+    def test_hide_helper_with_no_running_application_is_a_noop(self):
+        result = self.hide_logic({"apps": []})
+        self.assertNotIn("error", result)
+        self.assertEqual(result["requested"], [])
+
+    def test_hide_helper_waits_for_state_even_if_hide_returns_false(self):
+        result = self.hide_logic({"apps": [{"pid": 1, "falseReturn": True}]})
+        self.assertNotIn("error", result)
+        self.assertEqual(result["requested"], [1])
+        self.assertTrue(result["apps"][0]["hidden"])
+        self.assertGreater(result["clock"], 0)
+
+    def test_hide_helper_reports_resolution_request_and_timeout_failures(self):
+        for scenario in ({"registered": False}, {"apps": [{"pid": 1, "refuseHide": True}]},
+                         {"apps": [{"pid": 1, "neverHide": True}]}):
+            with self.subTest(scenario=scenario):
+                result = self.hide_logic(scenario)
+                self.assertIn("error", result)
+                self.assertLessEqual(result["clock"], 2200)
 
 
 if __name__ == "__main__":
