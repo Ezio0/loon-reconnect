@@ -1,0 +1,21 @@
+name: macOS checks
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Shell syntax
+        run: |
+          /bin/bash -n scripts/loon-reconnect.sh
+          /bin/sh -n scripts/reconnect.sh
+      - name: Isolated lifecycle and runtime tests
+        run: python3 -B -m unittest discover -s tests -p 'test_*.py' -v

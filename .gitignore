@@ -1,0 +1,7 @@
+.DS_Store
+.test-work/
+__pycache__/
+*.py[cod]
+*.log
+*.zip
+.venv/
