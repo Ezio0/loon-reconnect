@@ -222,8 +222,10 @@ class AutomationTests(unittest.TestCase):
         self.control("install", success=False)
         self.assertTrue(self.app.is_symlink())
 
-    def run_runtime(self, failures=(), fail_hide=False):
-        self.write_state({"calls": [], "fail_urls": list(failures), "fail_hide": fail_hide})
+    def run_runtime(self, failures=(), fail_hide=False, on_exit_codes=(), ignored_on_attempts=()):
+        self.write_state({"calls": [], "fail_urls": list(failures), "fail_hide": fail_hide,
+                          "on_exit_codes": list(on_exit_codes),
+                          "ignored_on_attempts": list(ignored_on_attempts)})
         source = RUNTIME.read_text()
         # Fail before execution if the known command seams change.
         self.assertEqual(source.count("/usr/bin/open"), 1)
@@ -238,30 +240,63 @@ class AutomationTests(unittest.TestCase):
             source = source.replace(original, shlex.quote(str(wrapper)))
         runtime = self.base / "reconnect-under-test.sh"
         runtime.write_text(source)
-        return subprocess.run(["/bin/sh", str(runtime)], text=True, capture_output=True)
+        return subprocess.run(["/bin/sh", str(runtime)], text=True, capture_output=True, timeout=10)
 
-    def test_runtime_sequence_and_failures(self):
-        expected = [
+    def assert_runtime_sequence(self):
+        self.assertEqual(self.read_state()["calls"], [
             ["open", "-g", "-j", "loon://off"], ["sleep", "3"],
+            ["open", "-g", "-j", "loon://on"], ["sleep", "10"],
             ["open", "-g", "-j", "loon://on"], ["sleep", "10"],
             ["open", "-g", "-j", "loon://update?sub=all"], ["sleep", "2"],
             ["osascript", "-l", "JavaScript"],
-        ]
-        for failures in ([], ["loon://off"], ["loon://on"], ["loon://update?sub=all"]):
+        ])
+
+    def test_runtime_sequence_and_failures(self):
+        for failures in ([], ["loon://off"], ["loon://on"], ["loon://update?sub=all"],
+                         ["loon://off", "loon://on", "loon://update?sub=all"]):
             with self.subTest(failures=failures):
                 result = self.run_runtime(failures)
                 self.assertEqual(result.returncode, int(bool(failures)))
-                self.assertEqual(self.read_state()["calls"], expected)
-                self.assertEqual(result.stdout.count(" sent "), 3 - len(failures))
-                self.assertEqual(result.stderr.count(" failed "), len(failures))
+                self.assert_runtime_sequence()
+                failed_calls = len(failures) + int("loon://on" in failures)
+                self.assertEqual(result.stdout.count(" sent "), 4 - failed_calls)
+                self.assertEqual(result.stderr.count(" failed "), failed_calls)
+                self.assertIn("hidden loon:// handler", result.stdout)
+
+    def test_on_is_reissued_after_successful_dispatch_without_effect(self):
+        result = self.run_runtime(ignored_on_attempts=[1])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_runtime_sequence()
+        self.assertEqual(self.read_state()["on_observations"], [
+            {"exit": 0, "connected": False}, {"exit": 0, "connected": True},
+        ])
+        self.assertIn("sent loon://on (attempt 1/2)", result.stdout)
+        self.assertIn("sent loon://on (attempt 2/2)", result.stdout)
+
+    def test_on_attempt_failures_do_not_skip_remaining_work(self):
+        for exit_codes in ([7, 0], [0, 7], [7, 7]):
+            with self.subTest(exit_codes=exit_codes):
+                result = self.run_runtime(on_exit_codes=exit_codes)
+                self.assertEqual(result.returncode, 1)
+                self.assert_runtime_sequence()
+                self.assertEqual(self.read_state()["on_attempts"], 2)
+                for attempt, code in enumerate(exit_codes, start=1):
+                    if code:
+                        self.assertIn(
+                            f"failed loon://on (attempt {attempt}/2) (open exit {code})",
+                            result.stderr,
+                        )
+                    else:
+                        self.assertIn(f"sent loon://on (attempt {attempt}/2)", result.stdout)
+                self.assertIn("sent loon://update?sub=all", result.stdout)
                 self.assertIn("hidden loon:// handler", result.stdout)
 
     def test_hide_failure_is_reported_after_network_actions(self):
         result = self.run_runtime(fail_hide=True)
         self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stdout.count(" sent "), 3)
+        self.assertEqual(result.stdout.count(" sent "), 4)
         self.assertIn("failed to hide", result.stderr)
-        self.assertEqual(self.read_state()["calls"][-1], ["osascript", "-l", "JavaScript"])
+        self.assert_runtime_sequence()
 
     def hide_logic(self, scenario):
         source = RUNTIME.read_text()

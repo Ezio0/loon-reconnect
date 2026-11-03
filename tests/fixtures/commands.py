@@ -50,8 +50,22 @@ def main():
         else:
             raise AssertionError("Unexpected launchctl action: " + action)
     elif command == "open":
-        if args[-1] in state.get("fail_urls", []):
+        url = args[-1]
+        if url in state.get("fail_urls", []):
             result = 7
+        if url == "loon://off" and result == 0:
+            state["simulated_connected"] = False
+        elif url == "loon://on":
+            attempt = state.get("on_attempts", 0) + 1
+            state["on_attempts"] = attempt
+            exit_codes = state.get("on_exit_codes", [])
+            if attempt <= len(exit_codes):
+                result = exit_codes[attempt - 1]
+            if result == 0 and attempt not in state.get("ignored_on_attempts", []):
+                state["simulated_connected"] = True
+            state.setdefault("on_observations", []).append(
+                {"exit": result, "connected": state.get("simulated_connected", False)}
+            )
     elif command == "osascript":
         if state.get("fail_hide"):
             print("Simulated hide failure", file=sys.stderr)

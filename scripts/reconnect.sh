@@ -3,13 +3,14 @@
 result=0
 
 send_action() {
+    attempt_note=${2:+ (attempt $2)}
     if /usr/bin/open -g -j "$1"; then
-        /usr/bin/printf '%s sent %s\n' \
-            "$(/bin/date '+%Y-%m-%d %H:%M:%S %z')" "$1"
+        /usr/bin/printf '%s sent %s%s\n' \
+            "$(/bin/date '+%Y-%m-%d %H:%M:%S %z')" "$1" "$attempt_note"
     else
         code=$?
-        /usr/bin/printf '%s failed %s (open exit %s)\n' \
-            "$(/bin/date '+%Y-%m-%d %H:%M:%S %z')" "$1" "$code" >&2
+        /usr/bin/printf '%s failed %s%s (open exit %s)\n' \
+            "$(/bin/date '+%Y-%m-%d %H:%M:%S %z')" "$1" "$attempt_note" "$code" >&2
         result=1
     fi
 }
@@ -65,8 +66,11 @@ LOON_HIDE_JXA
 # 即使关闭调用失败，也继续尝试开启。
 send_action 'loon://off'
 /bin/sleep 3
-send_action 'loon://on'
-/bin/sleep 10
+# 调用成功不代表 VPN 已恢复；固定补发一次 on，不重复 off，也不查询连接状态。
+for attempt in 1 2; do
+    send_action 'loon://on' "$attempt/2"
+    /bin/sleep 10
+done
 send_action 'loon://update?sub=all'
 /bin/sleep 2
 hide_loon

@@ -230,7 +230,7 @@ main() {
             /bin/sh -n "$app_dir/reconnect.sh" || fail 'The installed script has a syntax error.'
             is_loaded || fail 'The task is not loaded. Use resume first.'
             launchctl kickstart "$service"
-            printf 'Run requested. Check the logs after about 15–20 seconds.\n'
+            printf 'Run requested. Check the logs after about 30–40 seconds; command timeouts may take longer.\n'
             ;;
         pause) validate_installation; pause_command ;;
         resume)

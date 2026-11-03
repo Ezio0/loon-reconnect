@@ -4,10 +4,13 @@
 默认每 **6 小时**执行一次，安装或登录加载时不会立即执行。
 
 ```text
-关闭 VPN → 等待 3 秒 → 开启 VPN → 等待 10 秒 → 请求更新全部订阅 → 等待 2 秒 → 隐藏 Loon
+关闭 VPN → 等待 3 秒 → 开启 VPN（1/2）→ 等待 10 秒 → 再次开启（2/2）→ 等待 10 秒
+    → 请求更新全部订阅 → 等待 2 秒 → 隐藏 Loon
 ```
 
 重连脚本不查询 VPN 状态，不检测网络连通性。即使 VPN 被手动关闭，到时间也会执行完整流程。
+每轮固定发送两次开启请求，间隔 10 秒，为首次请求未生效留出第二次机会；
+即使第一次调用返回成功，也会进行第二次调用。每轮只关闭一次 VPN，不重复更新订阅。
 
 ## 使用条件
 
@@ -66,7 +69,7 @@ bash scripts/loon-reconnect.sh install --hours 3
 bash "$HOME/Library/Application Support/LoonAutomation/loon-reconnect.sh" status
 ```
 
-手动请求执行后，等待约 15–20 秒查看日志：
+手动请求执行后，等待约 30–40 秒查看日志；系统调用超时时可能需要更久：
 
 ```bash
 tail -n 20 "$HOME/Library/Logs/LoonAutomation/reconnect.log"
@@ -77,12 +80,14 @@ tail -n 20 "$HOME/Library/Logs/LoonAutomation/reconnect.err.log"
 
 ```text
 sent loon://off
-sent loon://on
+sent loon://on (attempt 1/2)
+sent loon://on (attempt 2/2)
 sent loon://update?sub=all
 ```
 
 每条日志还包含时间戳。**sent 只表示 URL 调用成功发出，不代表 VPN 已连通或订阅已更新。**
 关闭调用失败也会继续尝试开启和更新；任一调用失败时，脚本最终返回非零退出码。
+两次开启请求都记录各自的结果；第一次失败、第二次成功时，仍保留非零退出码，便于排查。
 
 更新请求发出后，脚本会等待 2 秒，再隐藏 Loon 的窗口，让应用继续在后台运行。
 隐藏成功会记录 `hidden loon:// handler`；隐藏失败会写入错误日志并返回非零退出码。
@@ -125,8 +130,10 @@ bash scripts/loon-reconnect.sh install --hours 6
 - 任务属于当前用户的图形会话；注销、关机或睡眠期间不运行。
 - 睡眠期间错过的间隔会跳过，不依赖唤醒补跑；详见本机 `man launchd.plist`。
 - 这是按间隔运行的任务，不是每天固定钟点运行。重新加载会重新开始等待。
-- 等待 10 秒和更新请求后的 2 秒都是固定延时，不代表网络已恢复或订阅更新已完成。
+- 两次开启请求后各等待 10 秒，更新请求后等待 2 秒；都是固定延时，不代表网络已恢复或订阅更新已完成。
 - 定时重连不能保证故障出现后立即恢复，也不能保证失去响应的 Loon 会处理 URL。
+- 有限重发针对 [issue #1](https://github.com/Ezio0/loon-reconnect/issues/1) 中首次开启未生效的风险；
+  该偶发故障的根因尚未确定，两次调用成功也不能作为连接恢复的证明。
 
 如果任务加载失败，工具会保留安装文件并尝试停用任务。处理系统报错后运行 `resume` 重试。
 `status` 的 `state = not running` 通常表示当前空闲；它不表示 VPN 已关闭。
