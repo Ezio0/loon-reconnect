@@ -13,6 +13,7 @@ CONTROL = ROOT / "scripts" / "loon-reconnect.sh"
 RUNTIME = ROOT / "scripts" / "reconnect.sh"
 FIXTURE = ROOT / "tests" / "fixtures" / "commands.py"
 LABEL = "com.ezio.loon-reconnect"
+VPN_ID = "12345678-1234-1234-1234-123456789ABC"
 HARNESS = r'''
 source "$1"
 configure_paths "$2"
@@ -222,17 +223,18 @@ class AutomationTests(unittest.TestCase):
         self.control("install", success=False)
         self.assertTrue(self.app.is_symlink())
 
-    def run_runtime(self, failures=(), fail_hide=False, on_exit_codes=(), ignored_on_attempts=()):
+    def run_runtime(self, failures=(), fail_hide=False, on_exit_codes=(), ignored_on_attempts=(), **scenario):
         self.write_state({"calls": [], "fail_urls": list(failures), "fail_hide": fail_hide,
                           "on_exit_codes": list(on_exit_codes),
-                          "ignored_on_attempts": list(ignored_on_attempts)})
+                          "ignored_on_attempts": list(ignored_on_attempts), **scenario})
         source = RUNTIME.read_text()
         # Fail before execution if the known command seams change.
         self.assertEqual(source.count("/usr/bin/open"), 1)
-        self.assertEqual(source.count("/bin/sleep"), 3)
-        self.assertEqual(source.count("/usr/bin/osascript"), 1)
+        self.assertEqual(source.count("/bin/sleep"), 4)
+        self.assertEqual(source.count("/usr/bin/osascript"), 2)
+        self.assertEqual(source.count("/usr/sbin/scutil"), 3)
         for command, original in (("open", "/usr/bin/open"), ("sleep", "/bin/sleep"),
-                                  ("osascript", "/usr/bin/osascript")):
+                                  ("osascript", "/usr/bin/osascript"), ("scutil", "/usr/sbin/scutil")):
             wrapper = self.base / ("fake_" + command)
             invocation = [sys.executable, str(FIXTURE), str(self.state_path), command]
             wrapper.write_text("#!/bin/sh\nexec " + shlex.join(invocation) + ' "$@"\n')
@@ -243,11 +245,14 @@ class AutomationTests(unittest.TestCase):
         return subprocess.run(["/bin/sh", str(runtime)], text=True, capture_output=True, timeout=10)
 
     def assert_runtime_sequence(self):
-        self.assertEqual(self.read_state()["calls"], [
-            ["open", "-g", "-j", "loon://off"], ["sleep", "3"],
-            ["open", "-g", "-j", "loon://on"], ["sleep", "10"],
-            ["open", "-g", "-j", "loon://on"], ["sleep", "10"],
-            ["open", "-g", "-j", "loon://update?sub=all"], ["sleep", "2"],
+        calls = [call for call in self.read_state()["calls"]
+                 if call[0] != "scutil" and call != ["sleep", "5"]]
+        self.assertEqual(calls, [
+            ["osascript", "-l", "JavaScript"],
+            ["open", "loon://off"], ["sleep", "3"],
+            ["open", "loon://on"], ["sleep", "10"],
+            ["open", "loon://on"], ["sleep", "10"],
+            ["open", "loon://update?sub=all"], ["sleep", "2"],
             ["osascript", "-l", "JavaScript"],
         ])
 
@@ -297,6 +302,93 @@ class AutomationTests(unittest.TestCase):
         self.assertEqual(result.stdout.count(" sent "), 4)
         self.assertIn("failed to hide", result.stderr)
         self.assert_runtime_sequence()
+
+    def test_connected_vpn_is_confirmed_without_native_restart(self):
+        result = self.run_runtime()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_state()
+        self.assertEqual(state.get("native_starts", 0), 0)
+        self.assertEqual(state["status_reads"], 2)
+        self.assertIn("vpn Connected (system status)", result.stdout)
+        self.assertNotIn("must-not-print", result.stdout + result.stderr)
+        self.assert_runtime_sequence()
+
+    def test_native_recovery_handles_ignored_on_and_update_disconnect(self):
+        for scenario in ({"ignored_on_attempts": [1, 2]}, {"disconnect_on_update": True},
+                         {"failures": ["loon://off", "loon://on", "loon://update?sub=all"],
+                          "simulated_connected": False}):
+            with self.subTest(scenario=scenario):
+                result = self.run_runtime(**scenario)
+                self.assertEqual(result.returncode, int("failures" in scenario), result.stderr)
+                self.assertEqual(self.read_state()["native_starts"], 1)
+                self.assertIn("requested system VPN start (attempt 1/2)", result.stdout)
+                self.assertIn("vpn Connected (system status)", result.stdout)
+                self.assert_runtime_sequence()
+
+    def test_native_recovery_retries_once_and_preserves_first_error(self):
+        result = self.run_runtime(ignored_on_attempts=[1, 2], start_exit_codes=[7, 0])
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.read_state()["native_starts"], 2)
+        self.assertIn("failed system VPN start (attempt 1/2, exit 7)", result.stderr)
+        self.assertIn("vpn Connected (system status)", result.stdout)
+        self.assert_runtime_sequence()
+
+    def test_native_success_without_connection_stops_after_two_attempts(self):
+        result = self.run_runtime(ignored_on_attempts=[1, 2], native_connect_attempts=[])
+        self.assertEqual(result.returncode, 1)
+        state = self.read_state()
+        self.assertEqual(state["native_starts"], 2)
+        self.assertEqual(sum(call == ["sleep", "5"] for call in state["calls"]), 12)
+        self.assertIn("failed to confirm VPN connection after recovery", result.stderr)
+        self.assertNotIn("vpn Connected (system status)", result.stdout)
+        self.assertIn("hidden loon:// handler", result.stdout)
+        self.assert_runtime_sequence()
+
+    def test_transitional_vpn_is_waited_for_without_interrupting_it(self):
+        for final_state in ("Connected", "Connecting", "Disconnecting"):
+            with self.subTest(final_state=final_state):
+                result = self.run_runtime(status_responses=[{"state": "Connected"},
+                    {"state": "Connecting"}, {"state": final_state}])
+                self.assertEqual(result.returncode, int(final_state != "Connected"), result.stderr)
+                state = self.read_state()
+                self.assertEqual(state.get("native_starts", 0), 0)
+                self.assertLessEqual(state["status_reads"], 8)
+                self.assertIn("hidden loon:// handler", result.stdout)
+
+    def test_invalid_vpn_lookup_stops_before_any_url_is_sent(self):
+        valid = f'* (Connected) {VPN_ID} VPN (org.example.Loon) "Loon" [VPN:org.example.Loon]'
+        for scenario in ({"handler_exit": 1}, {"handler_id": ""}, {"handler_id": "unsafe id"},
+                         {"list_exit": 1}, {"vpn_listing": ""},
+                         {"vpn_listing": valid + "\n" + valid},
+                         {"vpn_listing": valid.replace("* ", "  ", 1)},
+                         {"vpn_listing": valid.replace(VPN_ID, "invalid-id")},
+                         {"vpn_listing": valid.replace("[VPN:org.example.Loon]", "[VPN:org.example.Other]")}):
+            with self.subTest(scenario=scenario):
+                result = self.run_runtime(**scenario)
+                self.assertEqual(result.returncode, 1)
+                self.assertFalse(any(call[0] == "open" for call in self.read_state()["calls"]))
+                self.assertEqual(self.read_state().get("native_starts", 0), 0)
+
+    def test_matching_uses_bundle_identifier_and_uuid_not_display_name(self):
+        listing = (f'* (Connected) AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA VPN (org.other) "Loon" [VPN:org.other]\n'
+                   f'* (Connected) {VPN_ID} VPN (org.example.Loon) "自定义名称" [VPN:org.example.Loon]')
+        result = self.run_runtime(vpn_listing=listing, ignored_on_attempts=[1, 2])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(["scutil", "--nc", "start", VPN_ID], self.read_state()["calls"])
+
+    def test_unreadable_status_stops_recovery_and_hides_after_started_cycle(self):
+        for response in ({"state": "Invalid"}, {"state": ""}, {"state": "Connected", "exit": 7}):
+            for before_cycle in (True, False):
+                with self.subTest(response=response, before_cycle=before_cycle):
+                    responses = [response] if before_cycle else [{"state": "Connected"}, response]
+                    result = self.run_runtime(status_responses=responses)
+                    self.assertEqual(result.returncode, 1)
+                    state = self.read_state()
+                    self.assertEqual(state.get("native_starts", 0), 0)
+                    self.assertEqual(any(c[0] == "open" for c in state["calls"]), not before_cycle)
+                    self.assertNotIn("must-not-print", result.stdout + result.stderr)
+                    if not before_cycle:
+                        self.assertIn("hidden loon:// handler", result.stdout)
 
     def hide_logic(self, scenario):
         source = RUNTIME.read_text()

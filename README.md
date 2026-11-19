@@ -4,11 +4,13 @@
 默认每 **6 小时**执行一次，安装或登录加载时不会立即执行。
 
 ```text
-关闭 VPN → 等待 3 秒 → 开启 VPN（1/2）→ 等待 10 秒 → 再次开启（2/2）→ 等待 10 秒
-    → 请求更新全部订阅 → 等待 2 秒 → 隐藏 Loon
+识别 Loon VPN 并确认状态可读 → 关闭 VPN → 等待 3 秒 → 开启（1/2）→ 等待 10 秒
+    → 再次开启（2/2）→ 等待 10 秒 → 请求更新全部订阅 → 等待 2 秒
+    → 确认 VPN 状态，必要时有限恢复 → 隐藏 Loon
 ```
 
-重连脚本不查询 VPN 状态，不检测网络连通性。即使 VPN 被手动关闭，到时间也会执行完整流程。
+重连脚本读取系统 VPN 状态，不访问网站或进行网络测速。
+即使 VPN 被手动关闭，只要服务能被唯一识别且状态可读，到时间仍会执行完整流程。
 每轮固定发送两次开启请求，间隔 10 秒，为首次请求未生效留出第二次机会；
 即使第一次调用返回成功，也会进行第二次调用。每轮只关闭一次 VPN，不重复更新订阅。
 
@@ -19,7 +21,9 @@
 - 使用当前用户的终端执行，**无需 sudo、Homebrew 或额外运行时**。
 - 工具不会安装 Loon，也不需要读取你的订阅地址或凭证。
 
-工具使用 macOS 自带 Bash、launchctl、plutil 和 osascript。
+工具使用 macOS 自带 Bash、launchctl、plutil、osascript 和 scutil。
+系统中需有一个启用的 Loon VPN 服务；工具按实际 URL 处理程序的标识匹配服务，
+支持修改 VPN 显示名称。匹配缺失、匹配不唯一或状态不可读时会报错停止，不开始重连。
 目前在 Apple Silicon、macOS 27.0.1、系统 Bash 3.2 上完成隔离验证；其他系统版本尚未实机验证。
 
 ## 安装
@@ -69,7 +73,8 @@ bash scripts/loon-reconnect.sh install --hours 3
 bash "$HOME/Library/Application Support/LoonAutomation/loon-reconnect.sh" status
 ```
 
-手动请求执行后，等待约 30–40 秒查看日志；系统调用超时时可能需要更久：
+手动请求执行后，通常等待约 30–40 秒查看日志；恢复可能额外等待最多 90 秒，
+系统命令的执行或超时时间另计：
 
 ```bash
 tail -n 20 "$HOME/Library/Logs/LoonAutomation/reconnect.log"
@@ -83,13 +88,26 @@ sent loon://off
 sent loon://on (attempt 1/2)
 sent loon://on (attempt 2/2)
 sent loon://update?sub=all
+vpn Connected (system status)
+hidden loon:// handler
 ```
 
 每条日志还包含时间戳。**sent 只表示 URL 调用成功发出，不代表 VPN 已连通或订阅已更新。**
 关闭调用失败也会继续尝试开启和更新；任一调用失败时，脚本最终返回非零退出码。
 两次开启请求都记录各自的结果；第一次失败、第二次成功时，仍保留非零退出码，便于排查。
 
-更新请求发出后，脚本会等待 2 秒，再隐藏 Loon 的窗口，让应用继续在后台运行。
+更新请求发出后，脚本等待 2 秒并确认系统 VPN 状态：
+
+- 已连接：记录 `vpn Connected (system status)`，不发送系统启动命令。
+- 未连接：最多执行两次系统 VPN 启动，每次等待最多 30 秒确认结果。
+- 正在连接或断开：先等待最多 30 秒；若仍在过渡状态则报错，不打断该过程。
+- 状态读取失败或恢复仍未成功：写入错误日志并返回非零。
+
+系统恢复只发出开启请求，不再次关闭 VPN。`Connected` 只代表读取时系统认为隧道已连接，
+不代表网站可访问或订阅已更新成功。即使恢复成功，之前的 URL 或系统命令错误仍会保留。
+
+URL 调用允许 Loon 激活，以便被挂起的应用处理请求。执行期间 Loon 可能显示窗口并切到前台，
+完成连接确认或恢复后，脚本会隐藏窗口，让应用继续在后台运行。
 隐藏成功会记录 `hidden loon:// handler`；隐藏失败会写入错误日志并返回非零退出码。
 隐藏使用系统 AppKit 接口，不退出 Loon，也不使用模拟按键或 System Events。
 工具根据 `loon://` 的实际处理程序识别应用，无需填写应用名、安装路径或 bundle ID。
@@ -132,8 +150,9 @@ bash scripts/loon-reconnect.sh install --hours 6
 - 这是按间隔运行的任务，不是每天固定钟点运行。重新加载会重新开始等待。
 - 两次开启请求后各等待 10 秒，更新请求后等待 2 秒；都是固定延时，不代表网络已恢复或订阅更新已完成。
 - 定时重连不能保证故障出现后立即恢复，也不能保证失去响应的 Loon 会处理 URL。
-- 有限重发针对 [issue #1](https://github.com/Ezio0/loon-reconnect/issues/1) 中首次开启未生效的风险；
-  该偶发故障的根因尚未确定，两次调用成功也不能作为连接恢复的证明。
+- [Issue #1](https://github.com/Ezio0/loon-reconnect/issues/1) 后续出现连续 URL 超时，
+  因此新版本允许应用激活，并增加系统状态确认与有限恢复。实际故障的根因尚未完全确定。
+- 状态确认发生在每轮流程末尾，不持续监控 VPN；之后再次断开不会立即触发恢复。
 
 如果任务加载失败，工具会保留安装文件并尝试停用任务。处理系统报错后运行 `resume` 重试。
 `status` 的 `state = not running` 通常表示当前空闲；它不表示 VPN 已关闭。

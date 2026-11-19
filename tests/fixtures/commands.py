@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+VPN_ID = "12345678-1234-1234-1234-123456789ABC"
+
 
 def main():
     state_path = Path(sys.argv[1])
@@ -66,8 +68,44 @@ def main():
             state.setdefault("on_observations", []).append(
                 {"exit": result, "connected": state.get("simulated_connected", False)}
             )
+        elif url == "loon://update?sub=all" and state.get("disconnect_on_update"):
+            state["simulated_connected"] = False
+    elif command == "scutil":
+        if args == ["--nc", "list"]:
+            print(state.get("vpn_listing", '* (Connected) ' + VPN_ID +
+                            ' VPN (org.example.Loon) "Renamed VPN" [VPN:org.example.Loon]'))
+            result = state.get("list_exit", 0)
+        elif len(args) == 3 and args[:2] == ["--nc", "status"]:
+            if args[2] != VPN_ID:
+                raise AssertionError("Queried an unexpected VPN service")
+            responses = state.get("status_responses", [])
+            index = state.get("status_reads", 0)
+            response = responses[min(index, len(responses) - 1)] if responses else {
+                "state": "Connected" if state.get("simulated_connected", True) else "Disconnected"
+            }
+            state["status_reads"] = index + 1
+            print(response.get("state", "Unknown"))
+            print("Extended status: PRIVATE_TEST_VALUE = must-not-print")
+            result = response.get("exit", 0)
+        elif len(args) == 3 and args[:2] == ["--nc", "start"]:
+            if args[2] != VPN_ID:
+                raise AssertionError("Started an unexpected VPN service")
+            attempt = state.get("native_starts", 0) + 1
+            state["native_starts"] = attempt
+            codes = state.get("start_exit_codes", [])
+            result = codes[attempt - 1] if attempt <= len(codes) else 0
+            if result == 0 and attempt in state.get("native_connect_attempts", [1, 2]):
+                state["simulated_connected"] = True
+        else:
+            raise AssertionError("Unexpected scutil command: " + repr(args))
     elif command == "osascript":
-        if state.get("fail_hide"):
+        source = sys.stdin.read()
+        if "return identifier;" in source and "runningApplicationsWithBundleIdentifier" not in source:
+            print(state.get("handler_id", "org.example.Loon"))
+            result = state.get("handler_exit", 0)
+        elif "runningApplicationsWithBundleIdentifier" not in source:
+            raise AssertionError("Unexpected AppleScript helper")
+        elif state.get("fail_hide"):
             print("Simulated hide failure", file=sys.stderr)
             result = 7
         else:
