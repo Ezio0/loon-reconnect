@@ -1,4 +1,4 @@
-"""Isolated command double. Never invokes launchctl, open, or sleep."""
+"""Isolated command double. Never invokes launchctl, open, scutil, or sleep."""
 
 import json
 import sys
@@ -55,6 +55,11 @@ def main():
         url = args[-1]
         if url in state.get("fail_urls", []):
             result = 7
+        if url == "loon://off" and state.get("defer_off"):
+            # A timeout does not cancel delivery. Model the destructive request
+            # being processed only when the user later resumes the application.
+            state["pending_off"] = True
+            result = 7
         if url == "loon://off" and result == 0:
             state["simulated_connected"] = False
         elif url == "loon://on":
@@ -68,8 +73,13 @@ def main():
             state.setdefault("on_observations", []).append(
                 {"exit": result, "connected": state.get("simulated_connected", False)}
             )
-        elif url == "loon://update?sub=all" and state.get("disconnect_on_update"):
-            state["simulated_connected"] = False
+        elif url == "loon://update?sub=all":
+            state.setdefault("update_observations", []).append({
+                "connected": state.get("simulated_connected", True),
+                "elapsed": state.get("elapsed", 0),
+            })
+            if state.get("disconnect_on_update"):
+                state["simulated_connected"] = False
     elif command == "scutil":
         if args == ["--nc", "list"]:
             print(state.get("vpn_listing", '* (Connected) ' + VPN_ID +
@@ -87,15 +97,26 @@ def main():
             print(response.get("state", "Unknown"))
             print("Extended status: PRIVATE_TEST_VALUE = must-not-print")
             result = response.get("exit", 0)
+        elif len(args) == 3 and args[:2] == ["--nc", "stop"]:
+            if args[2] != VPN_ID:
+                raise AssertionError("Stopped an unexpected VPN service")
+            state["native_stops"] = state.get("native_stops", 0) + 1
+            result = state.get("stop_exit", 0)
+            if result == 0:
+                state["simulated_connected"] = False
         elif len(args) == 3 and args[:2] == ["--nc", "start"]:
             if args[2] != VPN_ID:
                 raise AssertionError("Started an unexpected VPN service")
             attempt = state.get("native_starts", 0) + 1
             state["native_starts"] = attempt
+            state.setdefault("start_times", []).append(state.get("elapsed", 0))
             codes = state.get("start_exit_codes", [])
             result = codes[attempt - 1] if attempt <= len(codes) else 0
-            if result == 0 and attempt in state.get("native_connect_attempts", [1, 2]):
+            if result == 0 and attempt in state.get("native_connect_attempts", [1, 2, 3, 4]):
                 state["simulated_connected"] = True
+            state.setdefault("start_observations", []).append(
+                {"exit": result, "connected": state.get("simulated_connected", False)}
+            )
         else:
             raise AssertionError("Unexpected scutil command: " + repr(args))
     elif command == "osascript":
@@ -110,7 +131,16 @@ def main():
             result = 7
         else:
             print("hidden loon:// handler")
-    elif command != "sleep":
+    elif command == "resume_deferred_urls":
+        if state.pop("pending_off", False):
+            state["simulated_connected"] = False
+    elif command == "sleep":
+        state["elapsed"] = state.get("elapsed", 0) + int(args[0])
+        if (state.get("on_demand_enabled", False) and not state.get("simulated_connected", True)
+                and state["elapsed"] >= state.get("auto_connect_at", float("inf"))):
+            state["simulated_connected"] = True
+            state["auto_reconnects"] = state.get("auto_reconnects", 0) + 1
+    else:
         raise AssertionError("Unexpected command: " + command)
     state_path.write_text(json.dumps(state))
     return result

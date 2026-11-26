@@ -223,10 +223,9 @@ class AutomationTests(unittest.TestCase):
         self.control("install", success=False)
         self.assertTrue(self.app.is_symlink())
 
-    def run_runtime(self, failures=(), fail_hide=False, on_exit_codes=(), ignored_on_attempts=(), **scenario):
+    def run_runtime(self, failures=(), fail_hide=False, **scenario):
         self.write_state({"calls": [], "fail_urls": list(failures), "fail_hide": fail_hide,
-                          "on_exit_codes": list(on_exit_codes),
-                          "ignored_on_attempts": list(ignored_on_attempts), **scenario})
+                          **scenario})
         source = RUNTIME.read_text()
         # Fail before execution if the known command seams change.
         self.assertEqual(source.count("/usr/bin/open"), 1)
@@ -245,100 +244,162 @@ class AutomationTests(unittest.TestCase):
         return subprocess.run(["/bin/sh", str(runtime)], text=True, capture_output=True, timeout=10)
 
     def assert_runtime_sequence(self):
-        calls = [call for call in self.read_state()["calls"]
-                 if call[0] != "scutil" and call != ["sleep", "5"]]
+        state = self.read_state()
+        calls = [call for call in state["calls"]
+                 if (call[0] != "scutil" or call[2] in ("stop", "start"))
+                 and call != ["sleep", "5"]]
+        self.assertLessEqual(state["native_starts"], 4)
         self.assertEqual(calls, [
             ["osascript", "-l", "JavaScript"],
-            ["open", "loon://off"], ["sleep", "3"],
-            ["open", "loon://on"], ["sleep", "10"],
-            ["open", "loon://on"], ["sleep", "10"],
+            ["scutil", "--nc", "stop", VPN_ID], ["sleep", "3"],
+            ["scutil", "--nc", "start", VPN_ID], ["sleep", "10"],
+            ["scutil", "--nc", "start", VPN_ID], ["sleep", "10"],
             ["open", "loon://update?sub=all"], ["sleep", "2"],
+            *([["scutil", "--nc", "start", VPN_ID]] * (state["native_starts"] - 2)),
             ["osascript", "-l", "JavaScript"],
         ])
 
     def test_runtime_sequence_and_failures(self):
-        for failures in ([], ["loon://off"], ["loon://on"], ["loon://update?sub=all"],
+        for failures in ([], ["loon://off", "loon://on"], ["loon://update?sub=all"],
                          ["loon://off", "loon://on", "loon://update?sub=all"]):
             with self.subTest(failures=failures):
                 result = self.run_runtime(failures)
-                self.assertEqual(result.returncode, int(bool(failures)))
+                failed_calls = int("loon://update?sub=all" in failures)
+                self.assertEqual(result.returncode, failed_calls)
                 self.assert_runtime_sequence()
-                failed_calls = len(failures) + int("loon://on" in failures)
-                self.assertEqual(result.stdout.count(" sent "), 4 - failed_calls)
+                self.assertEqual(result.stdout.count(" sent "), 1 - failed_calls)
                 self.assertEqual(result.stderr.count(" failed "), failed_calls)
                 self.assertIn("hidden loon:// handler", result.stdout)
 
-    def test_on_is_reissued_after_successful_dispatch_without_effect(self):
-        result = self.run_runtime(ignored_on_attempts=[1])
+    def test_second_system_start_handles_successful_request_without_effect(self):
+        result = self.run_runtime(native_connect_attempts=[2])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_runtime_sequence()
-        self.assertEqual(self.read_state()["on_observations"], [
+        self.assertEqual(self.read_state()["start_observations"], [
             {"exit": 0, "connected": False}, {"exit": 0, "connected": True},
         ])
-        self.assertIn("sent loon://on (attempt 1/2)", result.stdout)
-        self.assertIn("sent loon://on (attempt 2/2)", result.stdout)
+        self.assertIn("requested system VPN start (attempt 1/2)", result.stdout)
+        self.assertIn("requested system VPN start (attempt 2/2)", result.stdout)
 
-    def test_on_attempt_failures_do_not_skip_remaining_work(self):
-        for exit_codes in ([7, 0], [0, 7], [7, 7]):
+    def test_system_start_failures_do_not_skip_remaining_work(self):
+        for exit_codes in ([7, 0], [0, 7], [7, 7], [7, 7, 7, 7]):
             with self.subTest(exit_codes=exit_codes):
-                result = self.run_runtime(on_exit_codes=exit_codes)
+                result = self.run_runtime(start_exit_codes=exit_codes)
                 self.assertEqual(result.returncode, 1)
                 self.assert_runtime_sequence()
-                self.assertEqual(self.read_state()["on_attempts"], 2)
-                for attempt, code in enumerate(exit_codes, start=1):
+                self.assertGreaterEqual(self.read_state()["native_starts"], 2)
+                for attempt, code in enumerate(exit_codes[:2], start=1):
                     if code:
                         self.assertIn(
-                            f"failed loon://on (attempt {attempt}/2) (open exit {code})",
+                            f"failed system VPN start (attempt {attempt}/2) (scutil exit {code})",
                             result.stderr,
                         )
                     else:
-                        self.assertIn(f"sent loon://on (attempt {attempt}/2)", result.stdout)
+                        self.assertIn(f"requested system VPN start (attempt {attempt}/2)", result.stdout)
                 self.assertIn("sent loon://update?sub=all", result.stdout)
                 self.assertIn("hidden loon:// handler", result.stdout)
 
     def test_hide_failure_is_reported_after_network_actions(self):
         result = self.run_runtime(fail_hide=True)
         self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stdout.count(" sent "), 4)
+        self.assertEqual(result.stdout.count(" sent "), 1)
         self.assertIn("failed to hide", result.stderr)
         self.assert_runtime_sequence()
 
-    def test_connected_vpn_is_confirmed_without_native_restart(self):
+    def test_update_after_start_accepts_on_demand_reconnection(self):
+        for on_demand_enabled in (True, False):
+            with self.subTest(on_demand_enabled=on_demand_enabled):
+                result = self.run_runtime(on_demand_enabled=on_demand_enabled, auto_connect_at=2)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                state = self.read_state()
+                self.assertEqual(state["on_demand_enabled"], on_demand_enabled)
+                self.assertEqual(state.get("auto_reconnects", 0), int(on_demand_enabled))
+                self.assertEqual(state["start_times"], [3, 13])
+                self.assertEqual(state["update_observations"], [{"connected": True, "elapsed": 23}])
+                self.assertTrue(state["simulated_connected"])
+                self.assertEqual({c[2] for c in state["calls"] if c[0] == "scutil"},
+                                 {"list", "status", "stop", "start"})
+                self.assert_runtime_sequence()
+
+    def test_deferred_off_cannot_disconnect_after_cycle_finishes(self):
+        result = self.run_runtime(
+            failures=["loon://off", "loon://on", "loon://update?sub=all"], defer_off=True,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("vpn Connected (system status)", result.stdout)
+        resumed = subprocess.run(
+            [sys.executable, str(FIXTURE), str(self.state_path), "resume_deferred_urls"],
+            text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertTrue(self.read_state().get("simulated_connected", True),
+                        "A previously timed-out off URL disconnected the VPN after the script ended")
+
+    def test_native_switches_work_when_application_ignores_urls(self):
+        result = self.run_runtime(
+            failures=["loon://off", "loon://on", "loon://update?sub=all"],
+            simulated_connected=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        state = self.read_state()
+        self.assertEqual(state.get("native_stops", 0), 1)
+        self.assertEqual(state["native_starts"], 2)
+        self.assertTrue(state["simulated_connected"])
+        self.assertEqual([c for c in state["calls"] if c[0] == "open"],
+                         [["open", "loon://update?sub=all"]])
+        self.assertIn("vpn Connected (system status)", result.stdout)
+        self.assertIn("hidden loon:// handler", result.stdout)
+
+    def test_failed_system_stop_still_starts_and_updates(self):
+        result = self.run_runtime(stop_exit=7)
+        self.assertEqual(result.returncode, 1)
+        state = self.read_state()
+        self.assertEqual(state.get("native_stops", 0), 1)
+        self.assertEqual(state["native_starts"], 2)
+        self.assertIn("failed system VPN stop (scutil exit 7)", result.stderr)
+        self.assertEqual(len(state["update_observations"]), 1)
+        self.assertIn("sent loon://update?sub=all", result.stdout)
+        self.assertIn("vpn Connected (system status)", result.stdout)
+        self.assertIn("hidden loon:// handler", result.stdout)
+        self.assert_runtime_sequence()
+
+    def test_connected_vpn_is_confirmed_without_extra_recovery(self):
         result = self.run_runtime()
         self.assertEqual(result.returncode, 0, result.stderr)
         state = self.read_state()
-        self.assertEqual(state.get("native_starts", 0), 0)
+        self.assertEqual(state["native_starts"], 2)
         self.assertEqual(state["status_reads"], 2)
         self.assertIn("vpn Connected (system status)", result.stdout)
         self.assertNotIn("must-not-print", result.stdout + result.stderr)
         self.assert_runtime_sequence()
 
-    def test_native_recovery_handles_ignored_on_and_update_disconnect(self):
-        for scenario in ({"ignored_on_attempts": [1, 2]}, {"disconnect_on_update": True},
-                         {"failures": ["loon://off", "loon://on", "loon://update?sub=all"],
-                          "simulated_connected": False}):
+    def test_native_recovery_handles_ignored_starts_after_update(self):
+        for scenario in ({"native_connect_attempts": [3, 4]},
+                         {"disconnect_on_update": True},
+                         {"failures": ["loon://update?sub=all"], "disconnect_on_update": True}):
             with self.subTest(scenario=scenario):
                 result = self.run_runtime(**scenario)
                 self.assertEqual(result.returncode, int("failures" in scenario), result.stderr)
-                self.assertEqual(self.read_state()["native_starts"], 1)
-                self.assertIn("requested system VPN start (attempt 1/2)", result.stdout)
+                self.assertEqual(self.read_state()["native_starts"], 3)
+                self.assertIn("requested system VPN start (recovery attempt 1/2)", result.stdout)
                 self.assertIn("vpn Connected (system status)", result.stdout)
                 self.assert_runtime_sequence()
 
     def test_native_recovery_retries_once_and_preserves_first_error(self):
-        result = self.run_runtime(ignored_on_attempts=[1, 2], start_exit_codes=[7, 0])
+        result = self.run_runtime(native_connect_attempts=[4], start_exit_codes=[0, 0, 7, 0])
         self.assertEqual(result.returncode, 1)
-        self.assertEqual(self.read_state()["native_starts"], 2)
-        self.assertIn("failed system VPN start (attempt 1/2, exit 7)", result.stderr)
+        self.assertEqual(self.read_state()["native_starts"], 4)
+        self.assertIn("failed system VPN start (recovery attempt 1/2) (scutil exit 7)", result.stderr)
         self.assertIn("vpn Connected (system status)", result.stdout)
         self.assert_runtime_sequence()
 
-    def test_native_success_without_connection_stops_after_two_attempts(self):
-        result = self.run_runtime(ignored_on_attempts=[1, 2], native_connect_attempts=[])
+    def test_native_success_without_connection_stops_after_two_recovery_attempts(self):
+        result = self.run_runtime(native_connect_attempts=[])
         self.assertEqual(result.returncode, 1)
         state = self.read_state()
-        self.assertEqual(state["native_starts"], 2)
-        self.assertEqual(sum(call == ["sleep", "5"] for call in state["calls"]), 12)
+        self.assertEqual(state["native_starts"], 4)
+        recovery_calls = state["calls"][state["calls"].index(["scutil", "--nc", "start", VPN_ID]):]
+        self.assertEqual(sum(call == ["sleep", "5"] for call in recovery_calls), 12)
         self.assertIn("failed to confirm VPN connection after recovery", result.stderr)
         self.assertNotIn("vpn Connected (system status)", result.stdout)
         self.assertIn("hidden loon:// handler", result.stdout)
@@ -351,7 +412,7 @@ class AutomationTests(unittest.TestCase):
                     {"state": "Connecting"}, {"state": final_state}])
                 self.assertEqual(result.returncode, int(final_state != "Connected"), result.stderr)
                 state = self.read_state()
-                self.assertEqual(state.get("native_starts", 0), 0)
+                self.assertEqual(state["native_starts"], 2)
                 self.assertLessEqual(state["status_reads"], 8)
                 self.assertIn("hidden loon:// handler", result.stdout)
 
@@ -368,13 +429,15 @@ class AutomationTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertFalse(any(call[0] == "open" for call in self.read_state()["calls"]))
                 self.assertEqual(self.read_state().get("native_starts", 0), 0)
+                self.assertEqual(self.read_state().get("native_stops", 0), 0)
 
     def test_matching_uses_bundle_identifier_and_uuid_not_display_name(self):
         listing = (f'* (Connected) AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA VPN (org.other) "Loon" [VPN:org.other]\n'
                    f'* (Connected) {VPN_ID} VPN (org.example.Loon) "自定义名称" [VPN:org.example.Loon]')
-        result = self.run_runtime(vpn_listing=listing, ignored_on_attempts=[1, 2])
+        result = self.run_runtime(vpn_listing=listing)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(["scutil", "--nc", "start", VPN_ID], self.read_state()["calls"])
+        self.assertIn(["scutil", "--nc", "stop", VPN_ID], self.read_state()["calls"])
 
     def test_unreadable_status_stops_recovery_and_hides_after_started_cycle(self):
         for response in ({"state": "Invalid"}, {"state": ""}, {"state": "Connected", "exit": 7}):
@@ -384,7 +447,8 @@ class AutomationTests(unittest.TestCase):
                     result = self.run_runtime(status_responses=responses)
                     self.assertEqual(result.returncode, 1)
                     state = self.read_state()
-                    self.assertEqual(state.get("native_starts", 0), 0)
+                    self.assertEqual(state.get("native_starts", 0), 0 if before_cycle else 2)
+                    self.assertEqual(state.get("native_stops", 0), int(not before_cycle))
                     self.assertEqual(any(c[0] == "open" for c in state["calls"]), not before_cycle)
                     self.assertNotIn("must-not-print", result.stdout + result.stderr)
                     if not before_cycle:

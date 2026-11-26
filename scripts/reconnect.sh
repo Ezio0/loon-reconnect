@@ -75,6 +75,18 @@ wait_for_connection() {
     return 1
 }
 
+send_vpn_action() {
+    action_note=${2:+ ($2)}
+    # Control the system service directly: a suspended app must never retain
+    # a destructive URL that could run after this cycle has already finished.
+    if /usr/sbin/scutil --nc "$1" "$vpn_service" >/dev/null 2>&1; then
+        log_event "requested system VPN $1$action_note"
+    else
+        code=$?
+        log_error "failed system VPN $1$action_note (scutil exit $code)"
+    fi
+}
+
 ensure_connected() {
     read_vpn_state || return 1
     if [ "$vpn_state" = Connected ]; then
@@ -97,12 +109,7 @@ ensure_connected() {
             log_error "failed to confirm VPN connection: still $vpn_state; no additional start requested"
             return 1
         fi
-        if /usr/sbin/scutil --nc start "$vpn_service" >/dev/null 2>&1; then
-            log_event "requested system VPN start (attempt $recovery_attempt/2)"
-        else
-            code=$?
-            log_error "failed system VPN start (attempt $recovery_attempt/2, exit $code)"
-        fi
+        send_vpn_action start "recovery attempt $recovery_attempt/2"
         if wait_for_connection; then
             log_event 'vpn Connected (system status)'
             return 0
@@ -113,17 +120,14 @@ ensure_connected() {
     log_error 'failed to confirm VPN connection after recovery'
 }
 
-send_action() {
-    attempt_note=${2:+ (attempt $2)}
-    # Allow activation so a suspended iPad app can handle the URL on macOS.
-    if /usr/bin/open "$1"; then
-        /usr/bin/printf '%s sent %s%s\n' \
-            "$(/bin/date '+%Y-%m-%d %H:%M:%S %z')" "$1" "$attempt_note"
+send_update() {
+    # Only subscription updates use application URL delivery. Activation is
+    # allowed, but a timeout still does not guarantee the request was cancelled.
+    if /usr/bin/open 'loon://update?sub=all'; then
+        log_event 'sent loon://update?sub=all'
     else
         code=$?
-        /usr/bin/printf '%s failed %s%s (open exit %s)\n' \
-            "$(/bin/date '+%Y-%m-%d %H:%M:%S %z')" "$1" "$attempt_note" "$code" >&2
-        result=1
+        log_error "failed loon://update?sub=all (open exit $code)"
     fi
 }
 
@@ -180,14 +184,14 @@ resolve_vpn_service || exit 1
 read_vpn_state || exit 1
 
 # 即使关闭调用失败，也继续尝试开启。
-send_action 'loon://off'
+send_vpn_action stop
 /bin/sleep 3
-# 调用成功不代表 VPN 已恢复；固定补发一次 on，不重复 off。
+# 系统命令成功不代表 VPN 已恢复；固定补发一次 start，不重复 stop。
 for attempt in 1 2; do
-    send_action 'loon://on' "$attempt/2"
+    send_vpn_action start "attempt $attempt/2"
     /bin/sleep 10
 done
-send_action 'loon://update?sub=all'
+send_update
 /bin/sleep 2
 ensure_connected || result=1
 hide_loon
